@@ -1,0 +1,165 @@
+#!/bin/bash
+
+# Error handling
+set -e
+trap 'cleanup' EXIT INT TERM
+trap 'handle_error $? $LINENO' ERR
+
+# Global variables
+INVOKE_PID=""
+INVOKE_LOG="/tmp/invokeai.$$.log"
+FOUND_URL=false
+
+cleanup() {
+    # Kill InvokeAI if it's running
+    if [ ! -z "$INVOKE_PID" ]; then
+        kill $INVOKE_PID 2>/dev/null || true
+    fi
+    # Remove temporary log file
+    rm -f "$INVOKE_LOG"
+}
+
+handle_error() {
+    local exit_code=$1
+    local line_number=$2
+    echo "Error on line $line_number: Exit code $exit_code"
+    cleanup
+    exit $exit_code
+}
+
+# Function to check if a command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Function to extract URL from InvokeAI output
+parse_url() {
+    local line="$1"
+    if [[ $line =~ http://([^:]+):([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    fi
+}
+
+# Function to install cloudflared if not present
+install_cloudflared() {
+    if ! command_exists cloudflared; then
+        echo "Installing cloudflared..."
+        # Add Cloudflare GPG key
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-archive-keyring.gpg
+        # Add Cloudflare repository
+        echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+        # Update and install
+        sudo apt-get update && sudo apt-get install cloudflared -y
+    fi
+}
+
+# Function to copy to clipboard
+copy_to_clipboard() {
+    local url="$1"
+    echo "Copying to clipboard: $url"
+    
+    # Try different methods to copy to clipboard
+    if [ -n "$DISPLAY" ] && command_exists xclip; then
+        echo -n "$url" | xclip -selection clipboard
+    elif [ -n "$DISPLAY" ] && command_exists xsel; then
+        echo -n "$url" | xsel -ib
+    else
+        # If we can't copy to clipboard, save to a file
+        echo -n "$url" > "$HOME/tunnel_url.txt"
+        echo "Could not copy to clipboard (X11 display not available)"
+        echo "URL has been saved to: $HOME/tunnel_url.txt"
+    fi
+}
+
+# Function to start cloudflared and process its output
+start_cloudflared() {
+    local ip="$1"
+    local port="$2"
+    
+    cloudflared tunnel --url "http://$ip:$port" 2>&1 | while IFS= read -r line; do
+        echo "[Cloudflare] $line"
+        
+        # Look for the tunnel URL in the output
+        if [[ $line =~ https://.*[.]trycloudflare[.]com ]]; then
+            tunnel_url=$(echo "$line" | grep -o 'https://[^ ]*trycloudflare[.]com[^ ]*')
+            echo "[Script] Tunnel created, will show URL in 5 seconds..."
+            (
+                sleep 5
+                echo -e "\n[Script] ✨ Tunnel URL created: $tunnel_url"
+                copy_to_clipboard "$tunnel_url"
+                echo "[Script] URL has been copied to clipboard!"
+            ) &
+        fi
+    done
+}
+
+# Check if we're in the InvokeAI directory
+if [ ! -d ".venv" ]; then
+    echo "Error: .venv directory not found!"
+    echo "Please make sure you're in the InvokeAI installation directory."
+    echo "Current directory: $(pwd)"
+    exit 1
+fi
+
+# Check for the activate script
+if [ ! -f ".venv/bin/activate" ]; then
+    echo "Error: Virtual environment activation script not found!"
+    echo "Expected: .venv/bin/activate"
+    echo "Please ensure InvokeAI is properly installed."
+    exit 1
+fi
+
+# Check for invokeai-web
+if [ ! -f ".venv/bin/invokeai-web" ]; then
+    echo "Error: invokeai-web not found!"
+    echo "Expected: .venv/bin/invokeai-web"
+    echo "Please ensure InvokeAI is properly installed."
+    exit 1
+fi
+
+# Activate virtual environment
+echo "Activating virtual environment..."
+source .venv/bin/activate || {
+    echo "Error: Failed to activate virtual environment"
+    exit 1
+}
+
+# Install cloudflared if needed
+install_cloudflared
+
+# Start InvokeAI in background and redirect to log file
+echo "Starting InvokeAI..."
+.venv/bin/invokeai-web > "$INVOKE_LOG" 2>&1 &
+INVOKE_PID=$!
+
+# Function to monitor InvokeAI log and start tunnel when ready
+monitor_and_start_tunnel() {
+    local ip=""
+    local port=""
+    
+    # Wait for InvokeAI to start
+    while true; do
+        if [[ ! -d /proc/$INVOKE_PID ]]; then
+            echo "Error: InvokeAI process died unexpectedly"
+            exit 1
+        fi
+        
+        while IFS= read -r line; do
+            echo "[InvokeAI] $line"
+            
+            if [[ $line == *"Invoke running on"* ]] && [[ $FOUND_URL == false ]]; then
+                FOUND_URL=true
+                read ip port <<< $(parse_url "$line")
+                echo -e "\n[Script] 🚀 Found InvokeAI running on $ip:$port"
+                echo "[Script] Starting Cloudflare tunnel..."
+                
+                # Start cloudflared and process its output
+                start_cloudflared "$ip" "$port"
+                exit 0
+            fi
+        done < <(tail -f "$INVOKE_LOG")
+    done
+}
+
+# Start monitoring and tunnel
+monitor_and_start_tunnel
