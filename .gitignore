@@ -1,0 +1,5 @@
+# Ignore specific back file
+back
+backup/
+*.bak
+*~
